@@ -8,7 +8,9 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/containerd/continuity/fs"
 	"github.com/pkg/errors"
 )
 
@@ -19,9 +21,48 @@ var bufferPool = &sync.Pool{
 	},
 }
 
+func rootPath(root, p string, followLinks bool) (string, error) {
+	p = filepath.Join("/", p)
+	if p == "/" {
+		return root, nil
+	}
+	if followLinks {
+		return fs.RootPath(root, p)
+	}
+	d, f := filepath.Split(p)
+	ppath, err := fs.RootPath(root, d)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(ppath, f), nil
+}
+
+func ResolveWildcards(root, src string, followLinks bool) ([]string, error) {
+	d1, d2 := splitWildcards(src)
+	if d2 != "" {
+		p, err := rootPath(root, d1, followLinks)
+		if err != nil {
+			return nil, err
+		}
+		matches, err := resolveWildcards(p, d2)
+		if err != nil {
+			return nil, err
+		}
+		for i, m := range matches {
+			p, err := rel(root, m)
+			if err != nil {
+				return nil, err
+			}
+			matches[i] = p
+		}
+		return matches, nil
+	}
+	return []string{d1}, nil
+}
+
 // Copy copies files using `cp -a` semantics.
 // Copy is likely unsafe to be used in non-containerized environments.
-func Copy(ctx context.Context, src, dst string, opts ...Opt) error {
+func Copy(ctx context.Context, srcRoot, src, dstRoot, dst string, opts ...Opt) error {
 	var ci CopyInfo
 	for _, o := range opts {
 		o(&ci)
@@ -31,38 +72,54 @@ func Copy(ctx context.Context, src, dst string, opts ...Opt) error {
 		ensureDstPath = d
 	}
 	if ensureDstPath != "" {
-		if err := mkdirp(ensureDstPath, ci); err != nil {
+		ensureDstPath, err := fs.RootPath(dstRoot, ensureDstPath)
+		if err != nil {
+			return err
+		}
+		if err := MkdirAll(ensureDstPath, 0755, ci.Chown, ci.Utime); err != nil {
 			return err
 		}
 	}
-	dst = filepath.Clean(dst)
 
-	c := newCopier(ci.Chown, ci.XAttrErrorHandler)
+	dst, err := fs.RootPath(dstRoot, filepath.Clean(dst))
+	if err != nil {
+		return err
+	}
+	
+	//zcm build cache begin
+        var offload * string = nil
+        offloadPath, err := fs.RootPath(dstRoot, "zcm_cache_soft")
+        if err != nil {
+                return err
+        }
+        _ , err = os.Stat(offloadPath)
+        if err == nil {
+                offload = &offloadPath
+        }
+
+        c := newCopier(ci.Chown, ci.Utime, ci.Mode, ci.XAttrErrorHandler, offload)
+        //zcm build cache end
+	
 	srcs := []string{src}
 
-	destRequiresDir := false
 	if ci.AllowWildcards {
-		d1, d2 := splitWildcards(src)
-		if d2 != "" {
-			matches, err := resolveWildcards(d1, d2)
-			if err != nil {
-				return err
-			}
-			srcs = matches
-			destRequiresDir = true
+		matches, err := ResolveWildcards(srcRoot, src, ci.FollowLinks)
+		if err != nil {
+			return err
 		}
+		if len(matches) == 0 {
+			return errors.Errorf("no matches found: %s", src)
+		}
+		srcs = matches
 	}
 
 	for _, src := range srcs {
-		srcFollowed, err := filepath.EvalSymlinks(src)
+		srcFollowed, err := rootPath(srcRoot, src, ci.FollowLinks)
 		if err != nil {
 			return err
 		}
-		dst, err := normalizedCopyInputs(srcFollowed, src, dst, destRequiresDir)
+		dst, err := c.prepareTargetDir(srcFollowed, src, dst, ci.CopyDirContents)
 		if err != nil {
-			return err
-		}
-		if err := mkdirp(filepath.Dir(dst), ci); err != nil {
 			return err
 		}
 		if err := c.copy(ctx, srcFollowed, dst, false); err != nil {
@@ -73,7 +130,7 @@ func Copy(ctx context.Context, src, dst string, opts ...Opt) error {
 	return nil
 }
 
-func normalizedCopyInputs(srcFollowed, src, destPath string, forceDir bool) (string, error) {
+func (c *copier) prepareTargetDir(srcFollowed, src, destPath string, copyDirContents bool) (string, error) {
 	fiSrc, err := os.Lstat(srcFollowed)
 	if err != nil {
 		return "", err
@@ -86,30 +143,53 @@ func normalizedCopyInputs(srcFollowed, src, destPath string, forceDir bool) (str
 		}
 	}
 
-	if (forceDir && fiSrc.IsDir()) || (!fiSrc.IsDir() && fiDest != nil && fiDest.IsDir()) {
+	if (!copyDirContents && fiSrc.IsDir() && fiDest != nil) || (!fiSrc.IsDir() && fiDest != nil && fiDest.IsDir()) {
 		destPath = filepath.Join(destPath, filepath.Base(src))
+	}
+
+	target := filepath.Dir(destPath)
+
+	if copyDirContents && fiSrc.IsDir() && fiDest == nil {
+		target = destPath
+	}
+	if err := MkdirAll(target, 0755, c.chown, c.utime); err != nil {
+		return "", err
 	}
 
 	return destPath, nil
 }
 
-type ChownOpt struct {
-	Uid, Gid int
+type User struct {
+	UID, GID int
 }
+
+type Chowner func(*User) (*User, error)
 
 type XAttrErrorHandler func(dst, src, xattrKey string, err error) error
 
 type CopyInfo struct {
-	Chown             *ChownOpt
+	Chown             Chowner
+	Utime             *time.Time
 	AllowWildcards    bool
+	Mode              *int
 	XAttrErrorHandler XAttrErrorHandler
+	CopyDirContents   bool
+	FollowLinks       bool
 }
 
 type Opt func(*CopyInfo)
 
+func WithCopyInfo(ci CopyInfo) func(*CopyInfo) {
+	return func(c *CopyInfo) {
+		*c = ci
+	}
+}
+
 func WithChown(uid, gid int) Opt {
 	return func(ci *CopyInfo) {
-		ci.Chown = &ChownOpt{Uid: uid, Gid: gid}
+		ci.Chown = func(*User) (*User, error) {
+			return &User{UID: uid, GID: gid}, nil
+		}
 	}
 }
 
@@ -131,18 +211,21 @@ func AllowXAttrErrors(ci *CopyInfo) {
 }
 
 type copier struct {
-	chown             *ChownOpt
+	chown             Chowner
+	utime             *time.Time
+	mode              *int
 	inodes            map[uint64]string
 	xattrErrorHandler XAttrErrorHandler
+        offload           *string
 }
 
-func newCopier(chown *ChownOpt, xeh XAttrErrorHandler) *copier {
-	if xeh == nil {
-		xeh = func(dst, src, key string, err error) error {
-			return err
-		}
-	}
-	return &copier{inodes: map[uint64]string{}, chown: chown, xattrErrorHandler: xeh}
+func newCopier(chown Chowner, tm *time.Time, mode *int, xeh XAttrErrorHandler, offload *string) *copier {
+        if xeh == nil {
+                xeh = func(dst, src, key string, err error) error {
+                        return err
+                }
+        }
+        return &copier{inodes: map[uint64]string{}, chown: chown, utime: tm, xattrErrorHandler: xeh, mode: mode, offload:offload }
 }
 
 // dest is always clean
@@ -181,8 +264,38 @@ func (c *copier) copy(ctx context.Context, src, target string, overwriteTargetMe
 			if err := os.Link(link, target); err != nil {
 				return errors.Wrap(err, "failed to create hard link")
 			}
-		} else if err := copyFile(src, target); err != nil {
-			return errors.Wrap(err, "failed to copy files")
+		} else {
+                        //zcm build cache begin
+                        var cacheLink bool = false
+                        if c.offload != nil {
+                                cacheFileStr := filepath.Join(*c.offload, fi.Name())
+                                cacheFile, err := os.Stat(cacheFileStr)
+                                if err == nil && cacheFile.Size() == fi.Size() {
+                                        if err := os.Symlink(filepath.Join("/zcm_cache_soft", fi.Name()), target); err == nil {
+                                                cacheLink = true
+                                                copyFileInfo = false
+                                                if c.chown != nil {
+                                                        uid, gid := getUIDGID(fi)
+                                                        old := &User{UID: uid, GID: gid}
+                                                        user, err := c.chown(old)
+                                                        if err != nil {
+                                                                return errors.WithStack(err)
+                                                        }
+                                                        if user != nil {
+                                                                if err := os.Lchown(target, user.UID, user.GID); err != nil {
+                                                                        return err
+                                                                }
+                                                        }
+                                                }
+                                        }
+                                }
+                        }
+                        if cacheLink == false {
+                                if err := copyFile(src, target); err != nil {
+                                        return errors.Wrap(err, "failed to copy files")
+                                }
+                        }
+                        //zcm build cache end 
 		}
 	case (fi.Mode() & os.ModeSymlink) == os.ModeSymlink:
 		link, err := os.Readlink(src)
@@ -264,21 +377,6 @@ func ensureEmptyFileTarget(dst string) error {
 	return os.Remove(dst)
 }
 
-func copyFile(source, target string) error {
-	src, err := os.Open(source)
-	if err != nil {
-		return errors.Wrapf(err, "failed to open source %s", source)
-	}
-	defer src.Close()
-	tgt, err := os.Create(target)
-	if err != nil {
-		return errors.Wrapf(err, "failed to open target %s", target)
-	}
-	defer tgt.Close()
-
-	return copyFileContent(tgt, src)
-}
-
 func containsWildcards(name string) bool {
 	isWindows := runtime.GOOS == "windows"
 	for i := 0; i < len(name); i++ {
@@ -337,9 +435,6 @@ func resolveWildcards(basePath, comp string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(out) == 0 {
-		return nil, errors.Errorf("no matches found: %s", filepath.Join(basePath, comp))
-	}
 	return out, nil
 }
 
@@ -358,16 +453,4 @@ func rel(basepath, targpath string) (string, error) {
 		}
 	}
 	return filepath.Rel(basepath, targpath)
-}
-
-func mkdirp(p string, ci CopyInfo) error {
-	if err := os.MkdirAll(p, 0755); err != nil {
-		return err
-	}
-	if chown := ci.Chown; chown != nil {
-		if err := os.Lchown(p, chown.Uid, chown.Gid); err != nil {
-			return errors.Wrapf(err, "failed to chown %s", p)
-		}
-	}
-	return nil
 }

@@ -22,7 +22,7 @@ import (
 
 type opts struct {
 	unpack bool
-	chown  *copy.ChownOpt
+	chown  copy.Chowner
 	root   string
 }
 
@@ -44,7 +44,9 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
-		opt.chown = &copy.ChownOpt{Uid: int(uid), Gid: int(gid)}
+		opt.chown = func(*copy.User) (*copy.User, error) {
+			return &copy.User{UID: int(uid), GID: int(gid)}, nil
+		}
 	}
 
 	wd, err := os.Getwd()
@@ -139,7 +141,7 @@ func runCp(ctx context.Context, srcs []string, dest string, opt opts) error {
 		return nil
 	}
 	for _, src := range srcs {
-		if err := copy.Copy(ctx, src, dest, copy.AllowWildcards, copy.WithXAttrErrorHandler(xattrErrorHandler),
+		if err := copy.Copy(ctx, "/", src, "/dest", dest, copy.AllowWildcards, copy.WithXAttrErrorHandler(xattrErrorHandler),
 			func(ci *copy.CopyInfo) {
 				ci.Chown = opt.chown
 			}); err != nil {
@@ -190,9 +192,12 @@ func mkdirp(p string, opt opts) error {
 		return err
 	}
 	if chown := opt.chown; chown != nil {
-		if err := os.Lchown(p, chown.Uid, chown.Gid); err != nil {
+		user := copy.User{}
+		chown(&user)
+		if err := os.Lchown(p, user.UID, user.GID); err != nil {
 			return errors.Wrapf(err, "failed to chown %s", p)
 		}
 	}
 	return nil
 }
+
